@@ -1,0 +1,17 @@
+:root {
+  font-family: Arial, Helvetica, sans-serif;
+  color: #12324a;
+  background: #eef7ff;
+}
+
+body {
+  display: grid;
+  min-height: 100vh;
+  margin: 0;
+  place-items: center;
+}
+
+h1 {
+  font-size: clamp(2rem, 7vw, 5rem);
+  text-align: center;
+}
