@@ -30,9 +30,10 @@ kind: Service
 metadata:
   name: travelpro
 spec:
+  type: NodePort
   selector:
     app: travelpro
   ports:
     - port: 80
       targetPort: 80
-  type: ClusterIP
+      nodePort: 30080
