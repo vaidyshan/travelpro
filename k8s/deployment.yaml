@@ -12,6 +12,8 @@ spec:
       labels:
         app: travelpro
     spec:
+      imagePullSecrets:
+        - name: gitlab-registry
       containers:
         - name: travelpro
           image: registry.gitlab.com/vaidy.shanmugam1/travelpro:801855a6c0f4
@@ -37,3 +39,9 @@ spec:
     - port: 80
       targetPort: 80
       nodePort: 30080
+
+
+
+
+
+
