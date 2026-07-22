@@ -1,18 +1,29 @@
 # Travelpro - Travel the world
 
-A simple static website served by Nginx. It can run as a standalone Docker
-container or in a local kind Kubernetes cluster.
+A simple static website served by Nginx, built by GitLab CI, stored in the
+private GitLab Container Registry, and deployed to a local multi-node kind
+cluster.
+
+## Delivery flow
+
+```text
+GitHub source
+    -> GitLab CI checkout, test, and image build
+    -> private GitLab Container Registry
+    -> Kubernetes Deployment on kind
+    -> http://localhost:8080
+```
 
 ## Prerequisites
 
-Install and start the following tools:
+Install and start:
 
 - Git
 - Docker Desktop
 - `kubectl`
 - `kind`
 
-Verify the installation:
+Verify the tools:
 
 ```bash
 git --version
@@ -23,8 +34,6 @@ docker info
 ```
 
 ## Get the source code
-
-Clone the repository over SSH and enter the project directory:
 
 ```bash
 git clone git@github.com:vaidyshan/travelpro.git
@@ -47,7 +56,7 @@ docker run -d --name travelpro -p 8080:80 travelpro:local
 
 Open <http://localhost:8080>.
 
-Check or stop the container:
+Useful container commands:
 
 ```bash
 docker ps --filter name=travelpro
@@ -56,104 +65,200 @@ docker stop travelpro
 docker rm travelpro
 ```
 
-## Deploy to a local kind cluster
+## Build and publish with GitLab CI
 
-The kind configuration maps host port `8080` to Kubernetes node port `30080`.
-The application is therefore available without running `kubectl port-forward`.
+The GitLab CI project is:
 
-The traffic path is:
+<https://gitlab.com/vaidy.shanmugam1/travelpro>
+
+The pipeline clones the public GitHub repository, tests the image contents,
+and pushes two tags to the private GitLab Container Registry:
+
+```text
+registry.gitlab.com/vaidy.shanmugam1/travelpro:<GitHub-commit-SHA>
+registry.gitlab.com/vaidy.shanmugam1/travelpro:latest
+```
+
+Kubernetes uses the immutable GitHub commit SHA tag rather than `latest` so
+that every deployed version is reproducible and auditable.
+
+## Create the multi-node kind cluster
+
+The cluster contains one control-plane node and two worker nodes. The kind
+configuration maps host port `8080` to Kubernetes NodePort `30080`.
 
 ```text
 localhost:8080 -> kind node:30080 -> Service:80 -> Pod:80
 ```
 
-### 1. Build the local image
-
-From the repository root:
-
-```bash
-docker build -t travelpro:local .
-```
-
-### 2. Release port 8080
-
-Only one process can bind to port 8080. If the standalone Docker container is
-running, stop and remove it before creating the cluster:
+Release port 8080 if the standalone Docker container is running:
 
 ```bash
 docker stop travelpro
 docker rm travelpro
 ```
 
-Skip these commands if the container is not running.
+Skip those commands if the container is not running.
 
-### 3. Create the kind cluster
+Create the cluster:
 
 ```bash
-kind create cluster --name travelpro --config k8s/kind-config.yaml
-kubectl cluster-info --context kind-travelpro
+kind create cluster --name kind --config k8s/kind-config.yaml
+kubectl cluster-info --context kind-kind
 kubectl get nodes
 ```
 
-If a cluster named `travelpro` already exists and you need to recreate its port
-mapping, delete it first. This removes every workload in that cluster:
+Expected nodes:
 
-```bash
-kind delete cluster --name travelpro
-kind create cluster --name travelpro --config k8s/kind-config.yaml
+```text
+kind-control-plane
+kind-worker
+kind-worker2
 ```
 
-### 4. Load the image into kind
-
-kind nodes cannot automatically use images from the host Docker image store.
-Load the image explicitly:
+If the `kind` cluster already exists, do not recreate it unless necessary.
+Recreating it deletes all workloads and Secrets in that cluster:
 
 ```bash
-kind load docker-image travelpro:local --name travelpro
+kind delete cluster --name kind
+kind create cluster --name kind --config k8s/kind-config.yaml
 ```
 
-Verify the image on the node:
+## Allow Kubernetes to pull the private image
 
-```bash
-docker exec travelpro-control-plane crictl images | grep travelpro
+The GitLab Container Registry is private. Create a project deploy token in
+GitLab under **Settings > Repository > Deploy tokens** with:
+
+```text
+Name: kind-registry-pull
+Scope: read_registry only
 ```
 
-### 5. Deploy the Kubernetes resources
+Use an expiration date and save the generated username and token securely.
+GitLab displays the token only once. Never commit the token or send it through
+chat, email, logs, or screenshots.
+
+Select the local cluster:
 
 ```bash
-kubectl config use-context kind-travelpro
+kubectl config use-context kind-kind
+```
+
+Read the credentials into temporary shell variables. Run each command first,
+then enter the requested value at its prompt. Do not include the credential in
+the command itself:
+
+```bash
+read -r "GITLAB_DEPLOY_USER?GitLab deploy username: "
+read -rs "GITLAB_DEPLOY_TOKEN?GitLab deploy token: "
+echo
+```
+
+Create or update the registry Secret:
+
+```bash
+kubectl create secret docker-registry gitlab-registry \
+  --docker-server=registry.gitlab.com \
+  --docker-username="$GITLAB_DEPLOY_USER" \
+  --docker-password="$GITLAB_DEPLOY_TOKEN" \
+  --dry-run=client \
+  -o yaml | kubectl apply -f -
+```
+
+Immediately remove the credentials from the shell:
+
+```bash
+unset GITLAB_DEPLOY_USER GITLAB_DEPLOY_TOKEN
+```
+
+Verify the Secret without displaying its contents:
+
+```bash
+kubectl get secret gitlab-registry
+kubectl get secret gitlab-registry -o jsonpath='{.type}{"\n"}'
+```
+
+Expected type:
+
+```text
+kubernetes.io/dockerconfigjson
+```
+
+The Secret is created directly in Kubernetes and is never committed to Git.
+It must exist in the same namespace as the Travelpro Deployment.
+
+## Deploy Travelpro to kind
+
+The Deployment manifest references an immutable GitLab Registry image and the
+`gitlab-registry` image-pull Secret:
+
+```yaml
+spec:
+  imagePullSecrets:
+    - name: gitlab-registry
+  containers:
+    - name: travelpro
+      image: registry.gitlab.com/vaidy.shanmugam1/travelpro:<GitHub-commit-SHA>
+      imagePullPolicy: IfNotPresent
+```
+
+Deploy and wait for readiness:
+
+```bash
 kubectl apply -f k8s/deployment.yaml
-kubectl rollout status deployment/travelpro
-```
-
-Verify the resources:
-
-```bash
-kubectl get deployments
-kubectl get pods -l app=travelpro
+kubectl rollout status deployment/travelpro --timeout=120s
+kubectl get pods -l app=travelpro -o wide
 kubectl get service travelpro
 ```
 
-The pod should show `Running` with `1/1` containers ready. Open
-<http://localhost:8080> to view the application.
-
-## Deploy application updates to kind
-
-After changing `index.html` or `styles.css`, rebuild and reload the image, then
-restart the Deployment:
+Verify the deployed image:
 
 ```bash
-docker build -t travelpro:local .
-kind load docker-image travelpro:local --name travelpro
-kubectl rollout restart deployment/travelpro
-kubectl rollout status deployment/travelpro
+kubectl get deployment travelpro \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
 ```
 
-Refresh <http://localhost:8080> after the rollout completes.
+Verify the application:
+
+```bash
+curl -I http://localhost:8080
+```
+
+Open <http://localhost:8080>. No `kubectl port-forward` process is required for
+the application.
+
+## Deploy an application update
+
+After changing `index.html`, `styles.css`, or `Dockerfile`:
+
+1. Commit and push the application change to GitHub.
+2. Run the GitLab pipeline.
+3. Confirm the new GitHub SHA tag in **Deploy > Container Registry**.
+4. Update the `image` tag in `k8s/deployment.yaml` to that immutable SHA.
+5. Apply and verify the Deployment.
+6. Commit and push the manifest update to GitHub.
+
+Example commands:
+
+```bash
+git add index.html styles.css Dockerfile
+git commit -m "Update Travelpro application"
+git push
+
+# After GitLab publishes the new immutable tag, update deployment.yaml.
+kubectl apply -f k8s/deployment.yaml
+kubectl rollout status deployment/travelpro --timeout=120s
+git add k8s/deployment.yaml
+git commit -m "Deploy updated Travelpro image [skip ci]"
+git push
+```
+
+Argo CD automation is intentionally deferred. After it is configured, Argo CD
+will replace the manual `kubectl apply` step.
 
 ## Troubleshooting
 
-Inspect the application and recent cluster events:
+Inspect the workload and recent events:
 
 ```bash
 kubectl get pods -l app=travelpro -o wide
@@ -163,15 +268,16 @@ kubectl logs deployment/travelpro
 kubectl get events --sort-by=.metadata.creationTimestamp
 ```
 
-If the pod reports `ErrImageNeverPull`, rebuild and reload the image:
+Common image errors:
 
-```bash
-docker build -t travelpro:local .
-kind load docker-image travelpro:local --name travelpro
-kubectl rollout restart deployment/travelpro
-```
+- `ErrImagePull`: check the registry image path and tag.
+- `ImagePullBackOff`: check that the deploy token is active and the Secret is
+  current.
+- `secret "gitlab-registry" not found`: create the Secret in the Deployment's
+  namespace.
+- `manifest unknown`: confirm that the immutable tag exists in GitLab.
 
-If port 8080 is already occupied, identify the process using it:
+Check whether port 8080 is occupied:
 
 ```bash
 lsof -nP -iTCP:8080 -sTCP:LISTEN
@@ -179,14 +285,15 @@ lsof -nP -iTCP:8080 -sTCP:LISTEN
 
 ## Cleanup
 
-Remove only the application resources:
+Remove only Travelpro:
 
 ```bash
 kubectl delete -f k8s/deployment.yaml
+kubectl delete secret gitlab-registry
 ```
 
-Remove the entire local cluster:
+Remove the entire cluster and all of its workloads and Secrets:
 
 ```bash
-kind delete cluster --name travelpro
+kind delete cluster --name kind
 ```
